@@ -1,0 +1,39 @@
+{
+  "name": "@xbtfx/mcp-trading",
+  "version": "1.0.0",
+  "description": "MCP server for the XBTFX Trading API — trade forex, metals, indices, and crypto from any AI agent",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "xbtfx-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "trading",
+    "forex",
+    "mt5",
+    "xbtfx",
+    "ai-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/XBTFX/xbtfx-mcp-server.git"
+  }
+}
