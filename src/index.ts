@@ -279,7 +279,7 @@ server.tool(
     volume: z.number().positive().describe("Lot size (e.g. 0.01). Must respect symbol volume constraints."),
     sl: z.number().optional().describe("Stop loss price"),
     tp: z.number().optional().describe("Take profit price"),
-    comment: z.string().max(27).optional().describe("Trade comment, max 27 ASCII chars. Prefixed with [API] in MT5."),
+    comment: z.string().max(27).optional().describe("Trade comment, max 27 ASCII chars. Prefixed with -API in MT5."),
     idempotency_key: z
       .string()
       .optional()
