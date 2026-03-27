@@ -2,7 +2,7 @@
 
 MCP server for the [XBTFX Trading API](https://console.xbtfx.com) — trade forex, metals, indices, and crypto from any AI agent that supports the [Model Context Protocol](https://modelcontextprotocol.io).
 
-Works with Claude Code, Claude Desktop, Cursor, Windsurf, and any other MCP-compatible client.
+Works with Claude Code, Claude Desktop, OpenAI Codex, Cursor, Windsurf, and any other MCP-compatible client.
 
 ## Setup
 
@@ -32,6 +32,18 @@ Add to `claude_desktop_config.json`:
     }
   }
 }
+```
+
+### OpenAI Codex
+
+```bash
+codex mcp add xbtfx-trading -- npx @xbtfx/mcp-trading
+```
+
+Then set the API key in your environment before running Codex:
+
+```bash
+export XBTFX_API_KEY="xbtfx_live_your_key_here"
 ```
 
 ### Cursor
