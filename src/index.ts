@@ -16,7 +16,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod/v3";
+import { z } from "zod";
 
 const API_URL = "https://interface.xbtfx.com";
 const API_KEY = process.env.XBTFX_API_KEY;
@@ -30,28 +30,49 @@ if (!API_KEY) {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-async function apiGet(path: string, params?: Record<string, string>): Promise<any> {
+const API_TIMEOUT_MS = 15_000;
+
+interface ApiResponse {
+  status: number;
+  data: any;
+  rateLimitRemaining?: number;
+  rateLimitBudget?: number;
+}
+
+async function apiGet(path: string, params?: Record<string, string>): Promise<ApiResponse> {
   const url = new URL(`${API_URL}${path}`);
   if (params) {
     for (const [k, v] of Object.entries(params)) {
       url.searchParams.set(k, v);
     }
   }
-  const res = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${API_KEY}` },
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`API ${res.status}: ${body}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${API_KEY}` },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`API ${res.status}: ${body}`);
+    }
+    return {
+      status: res.status,
+      data: await res.json(),
+      rateLimitRemaining: Number(res.headers.get("X-RateLimit-Remaining")) || undefined,
+      rateLimitBudget: Number(res.headers.get("X-RateLimit-Budget")) || undefined,
+    };
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
 async function apiPost(
   path: string,
   data: Record<string, any>,
   idempotencyKey?: string,
-): Promise<any> {
+): Promise<ApiResponse> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${API_KEY}`,
     "Content-Type": "application/json",
@@ -59,21 +80,48 @@ async function apiPost(
   if (idempotencyKey) {
     headers["Idempotency-Key"] = idempotencyKey;
   }
-  const res = await fetch(`${API_URL}${path}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`API ${res.status}: ${body}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_URL}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(data),
+      signal: controller.signal,
+    });
+    // Allow 207 through for reverse partial-failure
+    if (!res.ok && res.status !== 207) {
+      const body = await res.text();
+      throw new Error(`API ${res.status}: ${body}`);
+    }
+    return {
+      status: res.status,
+      data: await res.json(),
+      rateLimitRemaining: Number(res.headers.get("X-RateLimit-Remaining")) || undefined,
+      rateLimitBudget: Number(res.headers.get("X-RateLimit-Budget")) || undefined,
+    };
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
-function textResult(data: any) {
+function textResult(resp: ApiResponse) {
+  let text = JSON.stringify(resp.data, null, 2);
+  if (resp.rateLimitRemaining !== undefined && resp.rateLimitBudget !== undefined) {
+    text += `\n\n[Rate limit: ${resp.rateLimitRemaining}/${resp.rateLimitBudget} remaining]`;
+  }
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+    content: [{ type: "text" as const, text }],
+  };
+}
+
+function warnResult(resp: ApiResponse, warning: string) {
+  let text = `⚠️ ${warning}\n\n${JSON.stringify(resp.data, null, 2)}`;
+  if (resp.rateLimitRemaining !== undefined && resp.rateLimitBudget !== undefined) {
+    text += `\n\n[Rate limit: ${resp.rateLimitRemaining}/${resp.rateLimitBudget} remaining]`;
+  }
+  return {
+    content: [{ type: "text" as const, text }],
   };
 }
 
@@ -90,15 +138,18 @@ function errorResult(msg: string) {
 
 const server = new McpServer({
   name: "xbtfx-trading",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
-// ── Read tools ─────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Read tools
+// ---------------------------------------------------------------------------
 
 server.tool(
   "get_auth_status",
-  "Check API key status — returns login number, margin mode, permissions, and rate limit tier",
+  "Check API key status — returns login, margin mode (hedging/netting), permissions, and tier. Call this once at session start.",
   {},
+  { readOnlyHint: true, destructiveHint: false },
   async () => {
     try {
       return textResult(await apiGet("/v1/auth/status"));
@@ -110,8 +161,9 @@ server.tool(
 
 server.tool(
   "get_account",
-  "Get account balance, equity, margin, free margin, open P&L, and leverage",
+  "Get account balance, equity, margin, free margin, unrealized P&L, and leverage",
   {},
+  { readOnlyHint: true, destructiveHint: false },
   async () => {
     try {
       return textResult(await apiGet("/v1/account"));
@@ -123,11 +175,16 @@ server.tool(
 
 server.tool(
   "get_positions",
-  "List all open positions with ticket, symbol, side, volume, prices, SL/TP, and P&L",
-  {},
-  async () => {
+  "List open positions with ticket, symbol, side, volume, entry/current price, SL/TP, and P&L. Optionally filter by symbol.",
+  {
+    symbol: z.string().optional().describe("Filter by symbol (e.g. EURUSD). Omit to list all."),
+  },
+  { readOnlyHint: true, destructiveHint: false },
+  async ({ symbol }) => {
     try {
-      return textResult(await apiGet("/v1/positions"));
+      const params: Record<string, string> = {};
+      if (symbol) params.symbol = symbol;
+      return textResult(await apiGet("/v1/positions", Object.keys(params).length ? params : undefined));
     } catch (e: any) {
       return errorResult(e.message);
     }
@@ -136,8 +193,9 @@ server.tool(
 
 server.tool(
   "get_orders",
-  "List all pending orders (limit/stop) with ticket, symbol, type, volume, and trigger price",
+  "List pending limit/stop orders with ticket, symbol, type, volume, and trigger price",
   {},
+  { readOnlyHint: true, destructiveHint: false },
   async () => {
     try {
       return textResult(await apiGet("/v1/orders"));
@@ -149,17 +207,24 @@ server.tool(
 
 server.tool(
   "get_history",
-  "Get deal history. Period: today, last_week, last_month, last_3_months, or a custom date range",
+  "Get trade deal history. Use EITHER a preset period OR a from/to date range, not both. Custom ranges limited to 90 days. Costs 2 weight.",
   {
     period: z
-      .enum(["today", "last_week", "last_month", "last_3_months"])
+      .enum(["today", "last_3_days", "last_week", "last_month", "last_3_months", "last_6_months", "all"])
       .optional()
-      .describe("Predefined period (default: today)"),
-    from: z.string().optional().describe("Start date ISO 8601 (e.g. 2026-03-01T00:00:00Z)"),
-    to: z.string().optional().describe("End date ISO 8601"),
+      .describe("Preset period. Do not combine with from/to."),
+    from: z.string().optional().describe("Start date YYYY-MM-DD (use with 'to', not with 'period')"),
+    to: z.string().optional().describe("End date YYYY-MM-DD (use with 'from', not with 'period')"),
   },
+  { readOnlyHint: true, destructiveHint: false },
   async ({ period, from, to }) => {
     try {
+      if (period && (from || to)) {
+        return errorResult("Use either 'period' or 'from'+'to', not both.");
+      }
+      if ((from && !to) || (to && !from)) {
+        return errorResult("Both 'from' and 'to' are required for custom date range.");
+      }
       const params: Record<string, string> = {};
       if (period) params.period = period;
       if (from) params.from = from;
@@ -173,8 +238,9 @@ server.tool(
 
 server.tool(
   "get_symbols",
-  "List all available trading symbols with current bid/ask prices. Returns 400+ instruments",
+  "List all 400+ tradeable symbols with bid/ask. Warning: large response, costs 2 weight. Prefer get_symbol for a single instrument.",
   {},
+  { readOnlyHint: true, destructiveHint: false },
   async () => {
     try {
       return textResult(await apiGet("/v1/symbols"));
@@ -186,10 +252,11 @@ server.tool(
 
 server.tool(
   "get_symbol",
-  "Get detailed specification for a single symbol — digits, contract size, volume limits, spread, tradeable status",
+  "Get detailed spec for one symbol — digits, contract size, volume min/max/step, spread, margin rate. Call before trading to validate volume.",
   {
     symbol: z.string().describe("Symbol name, e.g. EURUSD, XAUUSD, NDXUSD"),
   },
+  { readOnlyHint: true, destructiveHint: false },
   async ({ symbol }) => {
     try {
       return textResult(await apiGet(`/v1/symbols/${symbol}`));
@@ -199,28 +266,33 @@ server.tool(
   },
 );
 
-// ── Trading tools ──────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Trading tools
+// ---------------------------------------------------------------------------
 
 server.tool(
   "trade",
-  "Open a new position. Supports optional SL/TP. Volume must respect the symbol's volume_min/volume_max/volume_step",
+  "Open a new position (market order). Call get_symbol first to check volume_min/max/step. Confirm with user before executing.",
   {
     symbol: z.string().describe("Trading symbol, e.g. EURUSD"),
     side: z.enum(["buy", "sell"]).describe("Trade direction"),
-    volume: z.number().positive().describe("Lot size (e.g. 0.01)"),
+    volume: z.number().positive().describe("Lot size (e.g. 0.01). Must respect symbol volume constraints."),
     sl: z.number().optional().describe("Stop loss price"),
     tp: z.number().optional().describe("Take profit price"),
+    comment: z.string().max(27).optional().describe("Trade comment, max 27 ASCII chars. Prefixed with [API] in MT5."),
     idempotency_key: z
       .string()
       .optional()
-      .describe("Unique key to prevent duplicate trades (recommended)"),
+      .describe("Unique key to prevent duplicate trades on retry. Auto-generated if omitted."),
   },
-  async ({ symbol, side, volume, sl, tp, idempotency_key }) => {
+  { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  async ({ symbol, side, volume, sl, tp, comment, idempotency_key }) => {
     try {
       const data: Record<string, any> = { symbol, side, volume };
       if (sl !== undefined) data.sl = sl;
       if (tp !== undefined) data.tp = tp;
-      const idem = idempotency_key ?? `mcp-trade-${Date.now()}`;
+      if (comment !== undefined) data.comment = comment;
+      const idem = idempotency_key ?? `mcp-trade-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       return textResult(await apiPost("/v1/trade", data, idem));
     } catch (e: any) {
       return errorResult(e.message);
@@ -230,16 +302,21 @@ server.tool(
 
 server.tool(
   "close_position",
-  "Close an open position by ticket number. Optionally close only a partial volume",
+  "Close an open position by ticket. Omit volume for full close, or specify volume for partial close.",
   {
     ticket: z.number().int().positive().describe("Position ticket number"),
-    volume: z.number().positive().optional().describe("Partial close volume (omit to close full position)"),
+    volume: z.number().positive().optional().describe("Partial close volume in lots (omit for full close)"),
+    comment: z.string().max(27).optional().describe("Close comment, max 27 ASCII chars"),
+    idempotency_key: z.string().optional().describe("Unique key to prevent duplicate close on retry. Auto-generated if omitted."),
   },
-  async ({ ticket, volume }) => {
+  { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  async ({ ticket, volume, comment, idempotency_key }) => {
     try {
       const data: Record<string, any> = { ticket };
       if (volume !== undefined) data.volume = volume;
-      return textResult(await apiPost("/v1/close", data));
+      if (comment !== undefined) data.comment = comment;
+      const idem = idempotency_key ?? `mcp-close-${ticket}-${Date.now()}`;
+      return textResult(await apiPost("/v1/close", data, idem));
     } catch (e: any) {
       return errorResult(e.message);
     }
@@ -248,18 +325,23 @@ server.tool(
 
 server.tool(
   "modify_position",
-  "Modify SL and/or TP on an existing position. Pass 0 to remove SL or TP",
+  "Update SL and/or TP on an open position. Pass 0 to remove SL or TP. At least one of sl or tp is required.",
   {
     ticket: z.number().int().positive().describe("Position ticket number"),
     sl: z.number().optional().describe("New stop loss price (0 to remove)"),
     tp: z.number().optional().describe("New take profit price (0 to remove)"),
   },
+  { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async ({ ticket, sl, tp }) => {
     try {
+      if (sl === undefined && tp === undefined) {
+        return errorResult("At least one of 'sl' or 'tp' must be provided.");
+      }
       const data: Record<string, any> = { ticket };
       if (sl !== undefined) data.sl = sl;
       if (tp !== undefined) data.tp = tp;
-      return textResult(await apiPost("/v1/modify", data));
+      const idem = `mcp-modify-${ticket}-${Date.now()}`;
+      return textResult(await apiPost("/v1/modify", data, idem));
     } catch (e: any) {
       return errorResult(e.message);
     }
@@ -268,16 +350,20 @@ server.tool(
 
 server.tool(
   "close_by",
-  "Close a position against an opposite position on the same symbol (hedging mode only)",
+  "Close two opposing positions against each other (saves spread on smaller side). Hedging accounts only — check get_auth_status first. Returns 400 on netting accounts.",
   {
-    ticket: z.number().int().positive().describe("Position to close"),
-    close_by_ticket: z.number().int().positive().describe("Opposite position to close against"),
+    position: z.number().int().positive().describe("First position ticket"),
+    position_by: z.number().int().positive().describe("Opposing position ticket (same symbol, opposite side)"),
+    comment: z.string().max(27).optional().describe("Close-by comment, max 27 ASCII chars"),
+    idempotency_key: z.string().optional().describe("Unique key to prevent duplicate close-by on retry. Auto-generated if omitted."),
   },
-  async ({ ticket, close_by_ticket }) => {
+  { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  async ({ position, position_by, comment, idempotency_key }) => {
     try {
-      return textResult(
-        await apiPost("/v1/close-by", { ticket, close_by_ticket }),
-      );
+      const data: Record<string, any> = { position, position_by };
+      if (comment !== undefined) data.comment = comment;
+      const idem = idempotency_key ?? `mcp-closeby-${position}-${position_by}-${Date.now()}`;
+      return textResult(await apiPost("/v1/close-by", data, idem));
     } catch (e: any) {
       return errorResult(e.message);
     }
@@ -286,13 +372,27 @@ server.tool(
 
 server.tool(
   "reverse_position",
-  "Reverse a position — closes current and opens opposite direction with same volume",
+  "Close a position and immediately open the opposite side with same volume. Two-step composite — if the re-open fails (207), the position is already closed. Costs 2 weight.",
   {
     ticket: z.number().int().positive().describe("Position ticket to reverse"),
+    comment: z.string().max(27).optional().describe("Reverse comment, max 27 ASCII chars"),
+    idempotency_key: z.string().optional().describe("Unique key to prevent duplicate reverse on retry. Auto-generated if omitted."),
   },
-  async ({ ticket }) => {
+  { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  async ({ ticket, comment, idempotency_key }) => {
     try {
-      return textResult(await apiPost("/v1/reverse", { ticket }));
+      const data: Record<string, any> = { ticket };
+      if (comment !== undefined) data.comment = comment;
+      const idem = idempotency_key ?? `mcp-reverse-${ticket}-${Date.now()}`;
+      const resp = await apiPost("/v1/reverse", data, idem);
+      if (resp.status === 207) {
+        return warnResult(
+          resp,
+          "PARTIAL FAILURE: The position was closed but the reverse open failed. " +
+          "The user may need to re-enter manually. Do NOT retry automatically.",
+        );
+      }
+      return textResult(resp);
     } catch (e: any) {
       return errorResult(e.message);
     }
@@ -301,11 +401,18 @@ server.tool(
 
 server.tool(
   "close_all",
-  "Close ALL open positions on the account. Use with caution",
-  {},
-  async () => {
+  "Close ALL open positions on the account. Destructive bulk operation — confirm with user first. Costs 10 weight.",
+  {
+    comment: z.string().max(27).optional().describe("Applied to all close operations"),
+    idempotency_key: z.string().optional().describe("Unique key to prevent duplicate bulk close. Auto-generated if omitted."),
+  },
+  { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  async ({ comment, idempotency_key }) => {
     try {
-      return textResult(await apiPost("/v1/close-all", {}));
+      const data: Record<string, any> = {};
+      if (comment !== undefined) data.comment = comment;
+      const idem = idempotency_key ?? `mcp-closeall-${Date.now()}`;
+      return textResult(await apiPost("/v1/close-all", data, idem));
     } catch (e: any) {
       return errorResult(e.message);
     }
@@ -314,20 +421,28 @@ server.tool(
 
 server.tool(
   "close_symbol",
-  "Close all positions for a specific symbol",
+  "Close all positions for a specific symbol. Destructive — confirm with user first. Costs 10 weight.",
   {
     symbol: z.string().describe("Symbol to close all positions for, e.g. EURUSD"),
+    comment: z.string().max(27).optional().describe("Applied to all close operations"),
+    idempotency_key: z.string().optional().describe("Unique key to prevent duplicate. Auto-generated if omitted."),
   },
-  async ({ symbol }) => {
+  { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  async ({ symbol, comment, idempotency_key }) => {
     try {
-      return textResult(await apiPost("/v1/close-symbol", { symbol }));
+      const data: Record<string, any> = { symbol };
+      if (comment !== undefined) data.comment = comment;
+      const idem = idempotency_key ?? `mcp-closesym-${symbol}-${Date.now()}`;
+      return textResult(await apiPost("/v1/close-symbol", data, idem));
     } catch (e: any) {
       return errorResult(e.message);
     }
   },
 );
 
-// ── Start ──────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
 
 async function main() {
   const transport = new StdioServerTransport();
