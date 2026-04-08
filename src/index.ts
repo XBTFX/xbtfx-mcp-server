@@ -252,7 +252,7 @@ server.tool(
 
 server.tool(
   "get_symbol",
-  "Get detailed spec for one symbol — digits, contract size, volume min/max/step, spread, margin rate. Call before trading to validate volume.",
+  "Get detailed spec for one symbol — digits, contract size, volume min/max/step, spread, margin rate, swap rates, trading sessions, and live bid/ask. Call before trading to validate volume.",
   {
     symbol: z.string().describe("Symbol name, e.g. EURUSD, XAUUSD, NDXUSD"),
   },
@@ -260,6 +260,47 @@ server.tool(
   async ({ symbol }) => {
     try {
       return textResult(await apiGet(`/v1/symbols/${symbol}`));
+    } catch (e: any) {
+      return errorResult(e.message);
+    }
+  },
+);
+
+server.tool(
+  "get_quote",
+  "Get the current live bid/ask price for one or more symbols. Returns prices from the Continuum feed. Use this to check prices before trading or to monitor price levels.",
+  {
+    symbols: z.array(z.string()).min(1).max(20).describe("Array of symbol names, e.g. [\"EURUSD\", \"XAUUSD\"]. Max 20."),
+  },
+  { readOnlyHint: true, destructiveHint: false },
+  async ({ symbols }) => {
+    try {
+      if (symbols.length === 1) {
+        const resp = await apiGet(`/v1/symbols/${symbols[0]}`);
+        const d = resp.data;
+        resp.data = {
+          symbol: d.symbol,
+          bid: d.bid,
+          ask: d.ask,
+          spread: d.spread,
+          digits: d.digits,
+        };
+        return textResult(resp);
+      }
+      // Multiple symbols — fetch full list and filter
+      const resp = await apiGet("/v1/symbols");
+      const requested = new Set(symbols.map((s: string) => s.toUpperCase()));
+      const quotes = resp.data.symbols
+        .filter((s: any) => requested.has(s.name))
+        .map((s: any) => ({
+          symbol: s.name,
+          bid: s.bid,
+          ask: s.ask,
+          spread: s.spread,
+          digits: s.digits,
+        }));
+      resp.data = { quotes, count: quotes.length };
+      return textResult(resp);
     } catch (e: any) {
       return errorResult(e.message);
     }
