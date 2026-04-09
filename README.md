@@ -76,7 +76,8 @@ Add to `.cursor/mcp.json`:
 | `get_orders` | Pending limit/stop orders |
 | `get_history` | Deal history by period or date range |
 | `get_symbols` | All 400+ tradeable instruments |
-| `get_symbol` | Detailed spec for one symbol (digits, volume limits, spread) |
+| `get_symbol` | Detailed spec for one symbol (digits, volume limits, spread, swaps, margins, sessions) |
+| `get_quote` | Live bid/ask prices for one or more symbols (max 20) |
 
 ### Trading
 
