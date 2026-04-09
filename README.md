@@ -1,8 +1,10 @@
 # XBTFX MCP Trading Server
 
-MCP server for the [XBTFX Trading API](https://console.xbtfx.com) — trade forex, metals, indices, and crypto from any AI agent that supports the [Model Context Protocol](https://modelcontextprotocol.io).
+MCP server for the [XBTFX Trading API](https://interface.xbtfx.com) — trade forex, crypto, metals, indices, stocks, and energies through XBTFX MetaTrader 5 accounts, from any AI agent that supports the [Model Context Protocol](https://modelcontextprotocol.io).
 
 Works with Claude Code, Claude Desktop, OpenAI Codex, Cursor, Windsurf, and any other MCP-compatible client.
+
+> **Note:** This API is for XBTFX trading accounts only. Create an account at [my.xbtfx.com](https://my.xbtfx.com) and manage API keys at [console.xbtfx.com](https://console.xbtfx.com).
 
 ## Setup
 
